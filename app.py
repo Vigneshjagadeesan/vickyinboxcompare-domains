@@ -60,24 +60,27 @@ if df is not None:
     st.sidebar.markdown("---")
     st.sidebar.header("🎯 Target Domain Matcher")
     target_input = st.sidebar.text_input("Enter Target Domain (e.g. site.com)", "").strip().lower()
-    
-    # Clean input
     target_clean = re.sub(r'^https?://', '', target_input).strip('/')
 
+    # Match Precision Controls
+    match_mode = st.sidebar.radio(
+        "Match Strength Filter",
+        ["Super Strong Only (Higher Authority)", "Close Range (±20%)", "Broad Range (±50%)"]
+    )
+    same_tld_only = st.sidebar.checkbox("Same TLD only (Match Extension)", value=False)
+    top_limit = st.sidebar.slider("Max Matching Domains to Show", min_value=10, max_value=200, value=30, step=10)
+
     st.sidebar.markdown("---")
-    st.sidebar.header("🔍 Manual Filters")
+    st.sidebar.header("🔍 Manual Explorer Filters")
     
-    # TLD Filter
     if 'Extension' in df.columns:
         available_tlds = sorted(df['Extension'].dropna().astype(str).unique().tolist())
         selected_tlds = st.sidebar.multiselect("Select TLDs", options=available_tlds)
     else:
         selected_tlds = []
 
-    # Keyword Search
     search_keyword = st.sidebar.text_input("General Domain Search (Contains)")
 
-    # Referring Domains Range
     range_options = [
         "All Ranges",
         "1 - 10",
@@ -91,7 +94,7 @@ if df is not None:
     ]
     selected_range = st.sidebar.selectbox("Select Count Range", range_options)
 
-    # Base Filtering
+    # General Filters
     filtered_df = df
 
     if selected_range == "1 - 10":
@@ -120,15 +123,12 @@ if df is not None:
     if search_keyword:
         filtered_df = filtered_df[filtered_df['Domain'].astype(str).str.contains(search_keyword.lower(), na=False)]
 
-    # --- TARGET DOMAIN LOOKALIKE ENGINE ---
+    # --- PRECISION LOOKALIKE ENGINE ---
     if target_clean:
-        st.subheader(f"🔍 Analysis & Lookalikes for: `{target_clean}`")
-        
+        st.subheader(f"🎯 Target Analysis: `{target_clean}`")
         target_row = df[df['Domain'].astype(str).str.lower() == target_clean]
-        
-        # Extract root keyword
         keyword_seed = target_clean.split('.')[0]
-        
+
         if not target_row.empty:
             t_ref = int(target_row['Referring_Domains'].values[0])
             t_rank = float(target_row['OpenPageRank_Score'].values[0])
@@ -136,48 +136,62 @@ if df is not None:
             
             c1, c2, c3 = st.columns(3)
             c1.metric("Target Referring Domains", f"{t_ref:,}")
-            c2.metric("Target PageRank", f"{t_rank:.2f}")
+            c2.metric("Target PageRank Score", f"{t_rank:.2f}")
             c3.metric("Target TLD", f".{t_ext}")
-            
-            # Find domains with similar strength (±40% ref range or close rank)
-            min_match_ref = max(1, int(t_ref * 0.6))
-            max_match_ref = int(t_ref * 1.4) + 5
-            
-            lookalike_df = df[
+
+            # Define strength boundary
+            if match_mode == "Super Strong Only (Higher Authority)":
+                min_match_ref = t_ref
+                max_match_ref = int(df['Referring_Domains'].max())
+            elif match_mode == "Close Range (±20%)":
+                min_match_ref = max(1, int(t_ref * 0.8))
+                max_match_ref = int(t_ref * 1.2) + 2
+            else:  # Broad Range
+                min_match_ref = max(1, int(t_ref * 0.5))
+                max_match_ref = int(t_ref * 1.5) + 5
+
+            match_pool = df[
                 (df['Domain'].astype(str).str.lower() != target_clean) &
                 (df['Referring_Domains'] >= min_match_ref) &
                 (df['Referring_Domains'] <= max_match_ref)
             ].copy()
-            
-            # Priority score: closer in rank and ref domains + keyword match
-            lookalike_df['Ref_Diff'] = (lookalike_df['Referring_Domains'] - t_ref).abs()
-            lookalike_df['Keyword_Bonus'] = lookalike_df['Domain'].astype(str).apply(
-                lambda x: 1 if (len(keyword_seed) > 3 and keyword_seed in x.lower()) else 0
+
+            if same_tld_only:
+                match_pool = match_pool[match_pool['Extension'] == t_ext]
+
+            # Rank by closest PageRank and highest Referring Domains
+            match_pool['Rank_Score_Diff'] = (match_pool['OpenPageRank_Score'] - t_rank).abs()
+            match_pool = match_pool.sort_values(
+                by=['Rank_Score_Diff', 'Referring_Domains'],
+                ascending=[True, False]
             )
-            
-            lookalike_df = lookalike_df.sort_values(by=['Keyword_Bonus', 'Ref_Diff'], ascending=[False, True])
-            
+
+            final_matches = match_pool.head(top_limit)
+
+            st.write(f"🔥 **Top {len(final_matches)} Strongest Matching Domains ({match_mode}):**")
+            st.dataframe(final_matches[['Domain', 'Extension', 'Referring_Domains', 'OpenPageRank_Score']])
+
+            match_csv = final_matches.to_csv(index=False).encode('utf-8-sig')
+            st.download_button(
+                label=f"📥 Download Top {len(final_matches)} Strong Domains (CSV)",
+                data=match_csv,
+                file_name=f"strong_matches_{target_clean}.csv",
+                mime="text/csv"
+            )
+
         else:
-            st.warning(f"`{target_clean}` database-la direct-a illa. Matching by keyword and authority profile:")
-            lookalike_df = df[df['Domain'].astype(str).str.contains(keyword_seed, na=False)].copy()
-            lookalike_df = lookalike_df.sort_values(by='Referring_Domains', ascending=False)
+            st.warning(f"`{target_clean}` list-la direct-a illa. Matching by keyword & high authority:")
+            keyword_pool = df[df['Domain'].astype(str).str.contains(keyword_seed, na=False)].copy()
+            final_matches = keyword_pool.sort_values(by='Referring_Domains', ascending=False).head(top_limit)
             
-        st.write(f"**Found {len(lookalike_df):,} Closely Matching Domains:**")
-        st.dataframe(lookalike_df[['Domain', 'Extension', 'Referring_Domains', 'OpenPageRank_Score']].head(2000))
-        
-        match_csv = lookalike_df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button(
-            label="📥 Download Similar Domains (CSV)",
-            data=match_csv,
-            file_name=f"lookalikes_for_{target_clean}.csv",
-            mime="text/csv"
-        )
+            st.write(f"Found {len(final_matches)} Strong Keyword Related Domains:")
+            st.dataframe(final_matches[['Domain', 'Extension', 'Referring_Domains', 'OpenPageRank_Score']])
+
         st.markdown("---")
 
-    # Regular Dashboard Table
+    # Regular Explorer
     st.subheader(f"General Explorer: {selected_policy}")
-    
-    sort_order = st.sidebar.radio("Sort Referring Domains", ["Low to High (Ascending)", "High to Low (Descending)"])
+    sort_order = st.sidebar.radio("Sort General Results", ["Low to High (Ascending)", "High to Low (Descending)"])
     if sort_order == "Low to High (Ascending)":
         filtered_df = filtered_df.sort_values(by="Referring_Domains", ascending=True)
     else:
@@ -188,11 +202,7 @@ if df is not None:
     col2.metric("Filtered Domains", f"{len(filtered_df):,}")
     col3.metric("Selected Range", selected_range)
 
-    preview_df = filtered_df.head(5000)
-    if len(filtered_df) > 5000:
-        st.info("Previewing top 5,000 filtered rows for smooth performance. Click below to download all results.")
-    
-    st.dataframe(preview_df[['Domain', 'Extension', 'Referring_Domains', 'OpenPageRank_Score']])
+    st.dataframe(filtered_df[['Domain', 'Extension', 'Referring_Domains', 'OpenPageRank_Score']].head(5000))
 
     csv_dl = filtered_df.to_csv(index=False).encode('utf-8-sig')
     st.download_button(
