@@ -8,9 +8,9 @@ import gc
 import dns.resolver
 from concurrent.futures import ThreadPoolExecutor
 
-st.set_page_config(page_title="Domain Intelligence Matcher", layout="wide")
+st.set_page_config(page_title="Domain Intelligence + MX Search", layout="wide")
 
-st.title("🎯 Domain Intelligence & DNS Fingerprint Matcher")
+st.title("🎯 Domain Intelligence & Live MX / DNS Matcher")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -114,6 +114,20 @@ selected_policy = st.sidebar.selectbox("Select DMARC Policy File", list(policies
 df = load_policy_data(policies[selected_policy])
 
 if df is not None:
+    # ==========================================================
+    # 1. DIRECT MX / DNS KEYWORD SEARCH BOX
+    # ==========================================================
+    st.sidebar.header("📧 Direct MX / DNS Search")
+    direct_mx_input = st.sidebar.text_input(
+        "Search by MX / Provider Keyword",
+        placeholder="e.g. google, aspmx, outlook, zoho"
+    ).strip().lower()
+    mx_scan_limit = st.sidebar.slider("MX Scan Pool Size", min_value=30, max_value=250, value=100, step=10)
+
+    # ==========================================================
+    # 2. SMART DOMAIN ANALYZER (TARGET DOMAIN INPUT)
+    # ==========================================================
+    st.sidebar.markdown("---")
     st.sidebar.header("🚀 Smart Domain Analyzer")
     smart_domain_input = st.sidebar.text_input(
         "Enter Any Domain (Auto DNS + Related)",
@@ -125,9 +139,11 @@ if df is not None:
         "Authority Strength Filter",
         ["Stronger or Equal (>= Target)", "Similar Strength (±30%)", "All Strong Domains"]
     )
-    # Safe pool size to prevent Streamlit Cloud 1GB RAM crash
-    candidate_pool_size = st.sidebar.slider("DNS Scan Pool Size", min_value=30, max_value=200, value=80, step=10)
+    candidate_pool_size = st.sidebar.slider("Related Scan Pool Size", min_value=30, max_value=200, value=80, step=10)
 
+    # ==========================================================
+    # 3. GENERAL EXPLORER FILTERS
+    # ==========================================================
     st.sidebar.markdown("---")
     st.sidebar.header("🔍 General Explorer Filters")
     if 'Extension' in df.columns:
@@ -142,7 +158,79 @@ if df is not None:
     ]
     selected_range = st.sidebar.selectbox("Referring Domains Range", range_options)
 
-    # --- SMART TARGET DOMAIN ENGINE ---
+    # Apply base range & TLD filters first
+    base_filtered = df
+    if selected_range == "1 - 10":
+        base_filtered = base_filtered[(base_filtered['Referring_Domains'] >= 1) & (base_filtered['Referring_Domains'] <= 10)]
+    elif selected_range == "10 - 20":
+        base_filtered = base_filtered[(base_filtered['Referring_Domains'] >= 10) & (base_filtered['Referring_Domains'] <= 20)]
+    elif selected_range == "20 - 50":
+        base_filtered = base_filtered[(base_filtered['Referring_Domains'] >= 20) & (base_filtered['Referring_Domains'] <= 50)]
+    elif selected_range == "50 - 100":
+        base_filtered = base_filtered[(base_filtered['Referring_Domains'] >= 50) & (base_filtered['Referring_Domains'] <= 100)]
+    elif selected_range == "100 - 500":
+        base_filtered = base_filtered[(base_filtered['Referring_Domains'] >= 100) & (base_filtered['Referring_Domains'] <= 500)]
+    elif selected_range == "500 - 1500":
+        base_filtered = base_filtered[(base_filtered['Referring_Domains'] >= 500) & (base_filtered['Referring_Domains'] <= 1500)]
+    elif selected_range == "1500+ (High Authority)":
+        base_filtered = base_filtered[base_filtered['Referring_Domains'] >= 1500]
+    elif selected_range == "Custom Range":
+        c1, c2 = st.sidebar.columns(2)
+        min_v = c1.number_input("Min", value=int(df['Referring_Domains'].min()), step=1)
+        max_v = c2.number_input("Max", value=int(df['Referring_Domains'].max()), step=1)
+        base_filtered = base_filtered[(base_filtered['Referring_Domains'] >= min_v) & (base_filtered['Referring_Domains'] <= max_v)]
+
+    if selected_tlds:
+        base_filtered = base_filtered[base_filtered['Extension'].isin(selected_tlds)]
+
+    # ==========================================================
+    # OUTPUT A: DIRECT MX KEYWORD SEARCH RESULTS
+    # ==========================================================
+    if direct_mx_input:
+        st.subheader(f"📧 Direct MX Search Results for: `{direct_mx_input}`")
+        
+        mx_candidates = base_filtered.sort_values(by=['Referring_Domains', 'OpenPageRank_Score'], ascending=[False, False]).head(mx_scan_limit).copy()
+        
+        if len(mx_candidates) > 0:
+            with st.spinner(f"Scanning MX & DNS records across top {len(mx_candidates)} filtered domains..."):
+                with ThreadPoolExecutor(max_workers=15) as executor:
+                    mx_scanned = list(executor.map(get_full_dns, mx_candidates['Domain'].tolist()))
+                
+                mx_dns_df = pd.DataFrame(mx_scanned)
+                mx_merged = pd.merge(mx_candidates, mx_dns_df, on='Domain', how='left')
+                
+                # Match MX keyword (also checks TXT/NS if needed, prioritizing MX)
+                mx_matches = mx_merged[
+                    mx_merged['MX'].str.contains(direct_mx_input, case=False, na=False)
+                ].copy()
+
+            total_mx = len(mx_matches)
+            if total_mx > 0:
+                PAGE_SIZE = 15
+                total_mx_pages = math.ceil(total_mx / PAGE_SIZE)
+                st.success(f"✅ Found **{total_mx}** Strong Domains using `{direct_mx_input}` MX!")
+                
+                mx_page = st.selectbox(f"Select MX Result Page (1 to {total_mx_pages})", list(range(1, total_mx_pages + 1)), key="mx_page")
+                s_idx = (mx_page - 1) * PAGE_SIZE
+                
+                cols = ['Domain', 'Referring_Domains', 'OpenPageRank_Score', 'MX', 'NS', 'TXT']
+                st.dataframe(mx_matches[cols].iloc[s_idx:s_idx + PAGE_SIZE], use_container_width=True)
+
+                mx_csv = mx_matches[cols].to_csv(index=False).encode('utf-8-sig')
+                st.download_button(
+                    label=f"📥 Download {total_mx} `{direct_mx_input}` MX Domains (CSV)",
+                    data=mx_csv,
+                    file_name=f"mx_{direct_mx_input}_domains.csv",
+                    mime="text/csv"
+                )
+            else:
+                st.info(f"No domains matched `{direct_mx_input}` MX in the top {mx_scan_limit} pool. Try increasing 'MX Scan Pool Size' or changing the range filter.")
+        gc.collect()
+        st.markdown("---")
+
+    # ==========================================================
+    # OUTPUT B: SMART TARGET DOMAIN ENGINE
+    # ==========================================================
     if target_clean:
         st.subheader(f"🔎 Deep DNS & Authority Analysis for: `{target_clean}`")
         
@@ -172,9 +260,7 @@ if df is not None:
             t_ref = 50
             st.caption(f"`{target_clean}` not in CSV — matching strong domains (Ref >= {t_ref}).")
 
-        pool = df[df['Domain'] != target_clean]
-        if selected_tlds:
-            pool = pool[pool['Extension'].isin(selected_tlds)]
+        pool = base_filtered[base_filtered['Domain'] != target_clean]
 
         if strength_mode == "Stronger or Equal (>= Target)":
             pool = pool[pool['Referring_Domains'] >= t_ref]
@@ -185,10 +271,8 @@ if df is not None:
 
         if len(pool) > 0:
             with st.spinner(f"Scanning DNS across {len(pool)} strong domains..."):
-                domains_to_scan = pool['Domain'].tolist()
-                # Safe max_workers=15 to keep RAM low
                 with ThreadPoolExecutor(max_workers=15) as executor:
-                    scanned_results = list(executor.map(get_full_dns, domains_to_scan))
+                    scanned_results = list(executor.map(get_full_dns, pool['Domain'].tolist()))
                 
                 dns_df = pd.DataFrame(scanned_results)
                 merged = pd.merge(pool, dns_df, on='Domain', how='left')
@@ -234,48 +318,25 @@ if df is not None:
                     mime="text/csv"
                 )
             else:
-                st.info("No exact DNS footprint matches found in this pool. Try increasing 'DNS Scan Pool Size'.")
+                st.info("No exact DNS footprint matches found in this pool. Try increasing 'Related Scan Pool Size'.")
         gc.collect()
         st.markdown("---")
 
-    # --- GENERAL EXPLORER ---
+    # ==========================================================
+    # OUTPUT C: GENERAL EXPLORER
+    # ==========================================================
     st.subheader(f"📊 General Explorer: {selected_policy}")
-    filtered_df = df
-
-    if selected_range == "1 - 10":
-        filtered_df = filtered_df[(filtered_df['Referring_Domains'] >= 1) & (filtered_df['Referring_Domains'] <= 10)]
-    elif selected_range == "10 - 20":
-        filtered_df = filtered_df[(filtered_df['Referring_Domains'] >= 10) & (filtered_df['Referring_Domains'] <= 20)]
-    elif selected_range == "20 - 50":
-        filtered_df = filtered_df[(filtered_df['Referring_Domains'] >= 20) & (filtered_df['Referring_Domains'] <= 50)]
-    elif selected_range == "50 - 100":
-        filtered_df = filtered_df[(filtered_df['Referring_Domains'] >= 50) & (filtered_df['Referring_Domains'] <= 100)]
-    elif selected_range == "100 - 500":
-        filtered_df = filtered_df[(filtered_df['Referring_Domains'] >= 100) & (filtered_df['Referring_Domains'] <= 500)]
-    elif selected_range == "500 - 1500":
-        filtered_df = filtered_df[(filtered_df['Referring_Domains'] >= 500) & (filtered_df['Referring_Domains'] <= 1500)]
-    elif selected_range == "1500+ (High Authority)":
-        filtered_df = filtered_df[filtered_df['Referring_Domains'] >= 1500]
-    elif selected_range == "Custom Range":
-        c1, c2 = st.sidebar.columns(2)
-        min_v = c1.number_input("Min", value=int(df['Referring_Domains'].min()), step=1)
-        max_v = c2.number_input("Max", value=int(df['Referring_Domains'].max()), step=1)
-        filtered_df = filtered_df[(filtered_df['Referring_Domains'] >= min_v) & (filtered_df['Referring_Domains'] <= max_v)]
-
-    if selected_tlds:
-        filtered_df = filtered_df[filtered_df['Extension'].isin(selected_tlds)]
-
     sort_order = st.sidebar.radio("Sort General Results", ["High to Low (Descending)", "Low to High (Ascending)"])
-    filtered_df = filtered_df.sort_values(by="Referring_Domains", ascending=(sort_order == "Low to High (Ascending)"))
+    sorted_df = base_filtered.sort_values(by="Referring_Domains", ascending=(sort_order == "Low to High (Ascending)"))
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Total Unique Domains", f"{len(df):,}")
-    col2.metric("Filtered Domains", f"{len(filtered_df):,}")
+    col2.metric("Filtered Domains", f"{len(sorted_df):,}")
     col3.metric("Selected Range", selected_range)
 
-    st.dataframe(filtered_df.head(2000), use_container_width=True)
+    st.dataframe(sorted_df.head(2000), use_container_width=True)
 
-    csv_dl = filtered_df.to_csv(index=False).encode('utf-8-sig')
+    csv_dl = sorted_df.to_csv(index=False).encode('utf-8-sig')
     st.download_button(
         label="📥 Download Filtered List (CSV)",
         data=csv_dl,
